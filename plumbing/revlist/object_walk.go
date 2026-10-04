@@ -3,6 +3,7 @@ package revlist
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/go-git/go-git/v6/plumbing"
@@ -19,8 +20,12 @@ type objectWalk struct {
 	havesQueue []*object.Commit
 	wantsSeen  map[plumbing.Hash]struct{}
 	havesSeen  map[plumbing.Hash]struct{}
-	seen       map[plumbing.Hash]struct{}
-	result     []plumbing.Hash
+	// seen holds objects that are already in result or excluded by the
+	// haves side (haves tips and edge parents). A seen tree is never
+	// walked again: everything below it is seen too, or could not be
+	// read. Anything that adds a tree here must uphold this.
+	seen   map[plumbing.Hash]struct{}
+	result []plumbing.Hash
 }
 
 func newObjectWalk(s storer.EncodedObjectStorer) (*objectWalk, error) {
@@ -110,7 +115,7 @@ func (w *objectWalk) seedWants(wants []plumbing.Hash) error {
 
 // seedHaves enqueues each have commit and pre-populates seen with all
 // tree/blob objects reachable from the haves tips. Non-commit objects
-// (tags, trees, blobs) are marked as seen so the diff walk skips them.
+// (tags, trees, blobs) are marked as seen so the tree walk skips them.
 // Missing objects (ErrObjectNotFound) are tolerated since the remote
 // may advertise refs we don't have locally.
 func (w *objectWalk) seedHaves(haves []plumbing.Hash) error {
@@ -235,16 +240,52 @@ func (w *objectWalk) walk() error {
 		return fmt.Errorf("commit %s has missing parent %s", mp.child, mp.hash)
 	}
 
-	// Phase 2: collect tree objects for new commits, skipping any
-	// that were painted by haves after being added to newCommits.
+	// Phase 2: drop new commits that were painted by haves after being
+	// added. Then, like Git's mark_edges_uninteresting, mark the trees
+	// of all edge parents (parents of new commits painted by haves) as
+	// seen before collecting any new tree, so that objects moved or
+	// copied from them are not sent. Shallow commits have no parents
+	// here, as with Git's grafts.
+	newCommits = slices.DeleteFunc(newCommits, func(c *object.Commit) bool {
+		return flags[c.Hash]&havePaint != 0
+	})
 	for _, lc := range newCommits {
-		if flags[lc.Hash]&havePaint != 0 {
+		if _, shallow := w.shallows[lc.Hash]; shallow {
 			continue
 		}
-		if err := w.processCommitTrees(lc); err != nil {
+		for _, ph := range lc.ParentHashes {
+			if flags[ph]&havePaint == 0 {
+				continue
+			}
+			if err := w.markEdgeTreeSeen(ph); err != nil {
+				return err
+			}
+		}
+	}
+	for _, lc := range newCommits {
+		if err := w.collectCommit(lc); err != nil {
 			return err
 		}
 	}
+	return nil
+}
+
+// markEdgeTreeSeen marks the tree of edge parent h as seen. A missing
+// edge parent is tolerated, as it may be beyond the haves boundary, but
+// the root tree of one that is present must be readable.
+func (w *objectWalk) markEdgeTreeSeen(h plumbing.Hash) error {
+	c, err := object.GetCommit(w.s, h)
+	if err != nil {
+		if errors.Is(err, plumbing.ErrObjectNotFound) {
+			return nil
+		}
+		return fmt.Errorf("getting parent commit %s: %w", h, err)
+	}
+	t, err := c.Tree()
+	if err != nil {
+		return fmt.Errorf("getting parent tree for %s: %w", h, err)
+	}
+	markTreeSeen(w.s, t, w.seen)
 	return nil
 }
 
@@ -297,9 +338,9 @@ func allStale(queue []*object.Commit, flags map[plumbing.Hash]uint8) bool {
 	return true
 }
 
-// walkFull is the fast path when there are no haves. It walks all
-// commits and collects every reachable tree/blob via a simple seen-set
-// traversal — no per-commit tree diffs needed.
+// walkFull is the fast path when there are no haves. It walks every
+// commit reachable from the wants and collects all of their trees and
+// blobs, without painting.
 func (w *objectWalk) walkFull() error {
 	for len(w.wantsQueue) > 0 {
 		lc := w.wantsQueue[0]
@@ -308,16 +349,8 @@ func (w *objectWalk) walkFull() error {
 		if _, ok := w.seen[lc.Hash]; ok {
 			continue
 		}
-		w.seen[lc.Hash] = struct{}{}
-		w.result = append(w.result, lc.Hash)
-
-		tree, err := lc.Tree()
-		if err != nil {
-			return fmt.Errorf("getting tree for %s: %w", lc.Hash, err)
-		}
-
-		if err := collectAllTreeObjects(w.s, tree, w.seen, &w.result); err != nil {
-			return fmt.Errorf("collecting tree objects for %s: %w", lc.Hash, err)
+		if err := w.collectCommit(lc); err != nil {
+			return err
 		}
 
 		if _, ok := w.shallows[lc.Hash]; ok {
@@ -339,37 +372,21 @@ func (w *objectWalk) walkFull() error {
 	return nil
 }
 
-// processCommitTrees collects new tree/blob objects for a commit by
-// diffing its tree against its parents' trees.
-func (w *objectWalk) processCommitTrees(lc *object.Commit) error {
+// collectCommit adds lc and every tree and blob reachable from it that
+// is not already seen to the result.
+func (w *objectWalk) collectCommit(lc *object.Commit) error {
 	if _, ok := w.seen[lc.Hash]; !ok {
 		w.seen[lc.Hash] = struct{}{}
 		w.result = append(w.result, lc.Hash)
 	}
 
-	newTree, err := lc.Tree()
+	tree, err := lc.Tree()
 	if err != nil {
 		return fmt.Errorf("getting tree for %s: %w", lc.Hash, err)
 	}
 
-	var oldTrees []*object.Tree
-	for i := 0; i < lc.NumParents(); i++ {
-		parent, err := lc.Parent(i)
-		if err != nil {
-			if errors.Is(err, plumbing.ErrObjectNotFound) {
-				continue // parent may be beyond haves boundary
-			}
-			return fmt.Errorf("getting parent commit %s: %w", lc.ParentHashes[i], err)
-		}
-		pt, err := parent.Tree()
-		if err != nil {
-			return fmt.Errorf("getting parent tree for %s: %w", parent.Hash, err)
-		}
-		oldTrees = append(oldTrees, pt)
-	}
-
-	if err := collectChangedTreeObjects(w.s, newTree, oldTrees, w.seen, &w.result); err != nil {
-		return fmt.Errorf("diffing trees for %s: %w", lc.Hash, err)
+	if err := collectAllTreeObjects(w.s, tree, w.seen, &w.result); err != nil {
+		return fmt.Errorf("collecting tree objects for %s: %w", lc.Hash, err)
 	}
 
 	return nil
@@ -386,94 +403,9 @@ func insertSorted(q *[]*object.Commit, c *object.Commit) {
 	(*q)[i] = c
 }
 
-// collectChangedTreeObjects walks newTree, comparing entry hashes against
-// all oldTrees. An entry is considered unchanged if any old tree contains the
-// same name with the same hash. Only new or modified tree and blob hashes are
-// added to result.
-func collectChangedTreeObjects(
-	s storer.EncodedObjectStorer,
-	newTree *object.Tree,
-	oldTrees []*object.Tree,
-	seen map[plumbing.Hash]struct{},
-	result *[]plumbing.Hash,
-) error {
-	// If newTree matches any old tree exactly, nothing changed.
-	for _, ot := range oldTrees {
-		if newTree.Hash == ot.Hash {
-			return nil
-		}
-	}
-
-	if _, ok := seen[newTree.Hash]; !ok {
-		seen[newTree.Hash] = struct{}{}
-		*result = append(*result, newTree.Hash)
-	}
-
-	// Build per-parent entry indexes for O(1) lookup.
-	oldEntryMaps := make([]map[string]plumbing.Hash, len(oldTrees))
-	for i, ot := range oldTrees {
-		oldEntryMaps[i] = make(map[string]plumbing.Hash, len(ot.Entries))
-		for _, e := range ot.Entries {
-			oldEntryMaps[i][e.Name] = e.Hash
-		}
-	}
-
-	for _, e := range newTree.Entries {
-		// Skip blobs we've already collected. Directories are not skipped
-		// here — a tree hash being "seen" means the hash itself was added
-		// to the result, but a prior diff-walk may not have collected all
-		// of its children. The recursive call handles dedup for trees.
-		if e.Mode != filemode.Dir {
-			if _, ok := seen[e.Hash]; ok {
-				continue
-			}
-		}
-		if e.Mode == filemode.Submodule {
-			continue
-		}
-
-		// If same name has same hash in any parent tree, unchanged—skip.
-		unchanged := false
-		for _, m := range oldEntryMaps {
-			if oh, ok := m[e.Name]; ok && oh == e.Hash {
-				unchanged = true
-				break
-			}
-		}
-		if unchanged {
-			continue
-		}
-
-		if e.Mode == filemode.Dir {
-			// Recurse into changed subtree. Collect the old versions of
-			// this subtree from all parents that have it.
-			newSub, err := object.GetTree(s, e.Hash)
-			if err != nil {
-				return fmt.Errorf("getting subtree %s: %w", e.Hash, err)
-			}
-			var oldSubs []*object.Tree
-			for _, m := range oldEntryMaps {
-				if oh, ok := m[e.Name]; ok {
-					if ot, err := object.GetTree(s, oh); err == nil {
-						oldSubs = append(oldSubs, ot)
-					}
-				}
-			}
-			if err := collectChangedTreeObjects(s, newSub, oldSubs, seen, result); err != nil {
-				return err
-			}
-		} else {
-			seen[e.Hash] = struct{}{}
-			*result = append(*result, e.Hash)
-		}
-	}
-
-	return nil
-}
-
 // collectAllTreeObjects recursively walks a tree, adding all unseen
-// tree and blob hashes to result. This is faster than collectChangedTreeObjects
-// when we need all objects (no haves to diff against).
+// tree and blob hashes to result. A seen tree is skipped without
+// descending into it, as all of its contents are seen as well.
 func collectAllTreeObjects(
 	s storer.EncodedObjectStorer,
 	t *object.Tree,
@@ -509,9 +441,11 @@ func collectAllTreeObjects(
 	return nil
 }
 
-// markTreeSeen recursively adds all tree and blob hashes in t to seen.
-// Objects added to seen are not added to result — this is used to mark
-// haves-reachable objects so they are skipped during diff walks.
+// markTreeSeen adds t and every tree and blob below it to seen, without
+// adding them to result. It excludes the objects reachable from haves
+// tips and edge parents. Like Git's mark_tree_uninteresting, a subtree
+// that cannot be read is still marked by hash, but not descended into,
+// so it is neither read nor sent when a want references it.
 func markTreeSeen(s storer.EncodedObjectStorer, t *object.Tree, seen map[plumbing.Hash]struct{}) {
 	if _, ok := seen[t.Hash]; ok {
 		return
@@ -525,9 +459,12 @@ func markTreeSeen(s storer.EncodedObjectStorer, t *object.Tree, seen map[plumbin
 			continue
 		}
 		if e.Mode == filemode.Dir {
-			if sub, err := object.GetTree(s, e.Hash); err == nil {
-				markTreeSeen(s, sub, seen)
+			sub, err := object.GetTree(s, e.Hash)
+			if err != nil {
+				seen[e.Hash] = struct{}{}
+				continue
 			}
+			markTreeSeen(s, sub, seen)
 		} else {
 			seen[e.Hash] = struct{}{}
 		}
