@@ -339,8 +339,10 @@ func (w *objectWalk) walkFull() error {
 	return nil
 }
 
-// processCommitTrees collects new tree/blob objects for a commit by
-// diffing its tree against its parents' trees.
+// processCommitTrees collects the tree and blob objects that lc adds to
+// the result. It diffs the tree of lc against the trees of its parents,
+// except for a shallow commit, whose parents are not sent: its tree is
+// collected whole.
 func (w *objectWalk) processCommitTrees(lc *object.Commit) error {
 	if _, ok := w.seen[lc.Hash]; !ok {
 		w.seen[lc.Hash] = struct{}{}
@@ -352,8 +354,15 @@ func (w *objectWalk) processCommitTrees(lc *object.Commit) error {
 		return fmt.Errorf("getting tree for %s: %w", lc.Hash, err)
 	}
 
+	// A shallow commit is a graft: its parents are never sent, so its whole
+	// tree is new to the receiver, not just what differs from theirs.
+	numParents := lc.NumParents()
+	if _, shallow := w.shallows[lc.Hash]; shallow {
+		numParents = 0
+	}
+
 	var oldTrees []*object.Tree
-	for i := 0; i < lc.NumParents(); i++ {
+	for i := 0; i < numParents; i++ {
 		parent, err := lc.Parent(i)
 		if err != nil {
 			if errors.Is(err, plumbing.ErrObjectNotFound) {

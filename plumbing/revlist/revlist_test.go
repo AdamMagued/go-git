@@ -793,6 +793,44 @@ func (s *RevListSuite) TestRevListObjects_ShallowTaggedCommitStopsAtBoundary() {
 	s.False(gotSet[missingParent], "missing parent beyond shallow boundary must not be walked")
 }
 
+func (s *RevListSuite) TestRevListObjects_ShallowBoundaryShipsFullTree() {
+	dotgit, err := fixtures.Basic().One().DotGit(fixtures.WithTargetDir(s.T().TempDir))
+	s.Require().NoError(err)
+	sto := filesystem.NewStorage(dotgit, cache.NewObjectLRUDefault())
+	defer func() { _ = sto.Close() }()
+	t := s.T()
+
+	license := plumbing.NewHash("32858aad3c383ed1ff0a0f9bdf231d54a00c9e88")
+	gitignore := plumbing.NewHash("c192bd6a24ea1ab01d78686e417c8bdc7c3d197f")
+
+	base := testMakeCommit(t, sto, testMakeTree(t, sto, nil))
+	have := testMakeCommit(t, sto, testMakeTree(t, sto, []object.TreeEntry{
+		{Name: "shared", Mode: filemode.Regular, Hash: gitignore},
+	}), base)
+	introducesLicense := testMakeCommit(t, sto, testMakeTree(t, sto, []object.TreeEntry{
+		{Name: "side", Mode: filemode.Regular, Hash: license},
+	}), base)
+	boundaryTree := testMakeTree(t, sto, []object.TreeEntry{
+		{Name: "shared", Mode: filemode.Regular, Hash: gitignore},
+		{Name: "side", Mode: filemode.Regular, Hash: license},
+	})
+	boundary := testMakeCommit(t, sto, boundaryTree, introducesLicense)
+	s.Require().NoError(sto.SetShallow([]plumbing.Hash{boundary}))
+
+	got, err := Objects(sto, []plumbing.Hash{boundary}, []plumbing.Hash{have})
+	s.Require().NoError(err)
+	gotSet := make(map[plumbing.Hash]bool, len(got))
+	for _, h := range got {
+		gotSet[h] = true
+	}
+
+	// git rev-list --objects would also list "shared": it only excludes the
+	// trees of edge commits, and a grafted boundary has no edge to the have.
+	// Excluding every have tip's tree is also correct, since the client has it.
+	s.Equal(map[plumbing.Hash]bool{boundary: true, boundaryTree: true, license: true}, gotSet,
+		"a shallow commit ships its whole tree, minus what the haves already have")
+}
+
 func (s *RevListSuite) TestRevListObjects_ClockSkewedHaveAncestorMissingParentTolerated() {
 	// A commit reachable from both wants and haves has a missing parent.
 	// Due to clock skew, that commit has a later timestamp than the
